@@ -27,13 +27,20 @@ func NewRetryService(commands *valve.CommandService, policy RetryPolicy) (*Retry
 	return &RetryService{commands: commands, policy: policy}, nil
 }
 
-func (s *RetryService) Open(ctx context.Context, sessionID uuid.UUID, generation uint64, valveID string) (model.ValveReceipt, error) {
-	commandID := uuid.New()
+// Open dispatches the open command with retries. The command identity comes
+// from the caller (derived from the fill session) and is reused across every
+// attempt, so a retry after a timeout can never actuate the valve twice
+// under different IDs.
+func (s *RetryService) Open(ctx context.Context, commandID, sessionID uuid.UUID, generation uint64, valveID string) (model.ValveReceipt, error) {
 	var lastErr error
 	for attempt := 0; attempt < s.policy.Attempts; attempt++ {
 		receipt, err := s.commands.Open(ctx, commandID, sessionID, generation, valveID)
 		if err == nil {
 			return receipt, nil
+		}
+		if errors.Is(err, valve.ErrCommandRejected) {
+			// Definitive refusal — retrying cannot change the outcome.
+			return model.ValveReceipt{}, err
 		}
 		lastErr = err
 		if attempt+1 < s.policy.Attempts {

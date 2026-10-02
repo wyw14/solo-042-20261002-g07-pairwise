@@ -17,6 +17,7 @@ import (
 type Dependencies struct {
 	Vessels        *vessel.Registry
 	Fills          *fill.Service
+	ValveCommands  *fill.ReconcileService
 	Alarms         *alarm.Service
 	Probes         *probe.Registry
 	ProbeLifecycle *probe.Lifecycle
@@ -61,6 +62,9 @@ func (s *Server) routes() chi.Router {
 		api.Post("/fill-sessions/{id}/complete", s.completeFill)
 		api.Post("/fill-sessions/{id}/abort", s.abortFill)
 		api.Post("/fill-sessions/{id}/recover-isolation", s.recoverFillIsolation)
+		api.Get("/valve-commands", s.listValveCommands)
+		api.Get("/valve-commands/{id}", s.getValveCommand)
+		api.Post("/valve-commands/{id}/reconcile", s.reconcileValveCommand)
 		api.Get("/alarms", s.listAlarms)
 		api.Post("/alarms", s.raiseAlarm)
 		api.Post("/alarms/{id}/acknowledge", s.acknowledgeAlarm)

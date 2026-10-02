@@ -29,6 +29,7 @@ type runtime struct {
 	retryQueue   *notify.RetryQueue
 	dispatcher   *notify.Dispatcher
 	alarmService *alarm.Service
+	outbox       *valve.Outbox
 }
 
 func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
@@ -135,6 +136,12 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 		circuit.Circuit{ID: "C-B", Zone: "south", ValveID: "VALVE-B", Enabled: true},
 	)
 	circuitManager := circuit.NewManager("C-A", "C-B")
+	circuitManager.AttachJournal(store, now)
+	if replayErr := journal.NewReplay(store).Partition(circuit.ReservationPartition, func(event model.Event) error {
+		return circuitManager.Restore([]model.Event{event})
+	}); replayErr != nil {
+		return nil, replayErr
+	}
 	if err := circuitRegistry.UpdatePressure("C-A", 121.0); err != nil {
 		return nil, err
 	}
@@ -142,12 +149,27 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 		return nil, err
 	}
 	circuitHealth := circuit.NewHealthService(circuitRegistry, circuitManager, now)
+	outbox, err := valve.NewOutbox(store, now)
+	if err != nil {
+		return nil, err
+	}
+	if replayErr := journal.NewReplay(store).Partition(valve.OutboxPartition, func(event model.Event) error {
+		return outbox.Restore([]model.Event{event})
+	}); replayErr != nil {
+		return nil, replayErr
+	}
+	if pending := len(outbox.Pending()); pending > 0 {
+		slog.Warn("valve commands awaiting reconciliation", "count", pending)
+	}
 	transport := valve.NewMemoryTransport(now)
 	valveController, err := valve.NewController(transport, now)
 	if err != nil {
 		return nil, err
 	}
-	commandService := valve.NewCommandService(valveController, now)
+	commandService, err := valve.NewCommandService(valveController, outbox, now)
+	if err != nil {
+		return nil, err
+	}
 	routeService := valve.NewRouteService(commandService)
 	fillCoordinator := fill.NewCoordinator(circuitManager, circuitRegistry, routeService, vesselState, now)
 	retryService, err := fill.NewRetryService(commandService, fill.RetryPolicy{Attempts: 3, Delay: 100 * time.Millisecond})
@@ -156,7 +178,8 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 	}
 	fillCoordinator.SetRetryService(retryService)
 	completion := fill.NewCompletionService(fillCoordinator, pressureMonitor, store, now)
-	aborts := fill.NewAbortService(fillCoordinator, now)
+	aborts := fill.NewAbortService(fillCoordinator, outbox, now)
+	reconcileService := fill.NewReconcileService(fillCoordinator, outbox, now)
 	fillService, err := fill.NewService(fillCoordinator, completion, aborts, 2.1)
 	if err != nil {
 		return nil, err
@@ -196,6 +219,7 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 	apiServer := api.NewServer(api.Dependencies{
 		Vessels:        vesselRegistry,
 		Fills:          fillService,
+		ValveCommands:  reconcileService,
 		Alarms:         alarmService,
 		Probes:         probeRegistry,
 		ProbeLifecycle: probeLifecycle,
@@ -213,7 +237,7 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	return &runtime{server: server, retryQueue: retryQueue, dispatcher: dispatcher, alarmService: alarmService}, nil
+	return &runtime{server: server, retryQueue: retryQueue, dispatcher: dispatcher, alarmService: alarmService, outbox: outbox}, nil
 }
 
 func (r *runtime) run(ctx context.Context) error {
@@ -238,6 +262,9 @@ func (r *runtime) run(ctx context.Context) error {
 			_ = r.retryQueue.RunDue(ctx, r.dispatcher)
 			if pending := len(r.retryQueue.Pending()); pending > 0 {
 				slog.Warn("alarm notifications awaiting retry", "count", pending)
+			}
+			if pending := len(r.outbox.Pending()); pending > 0 {
+				slog.Warn("valve commands awaiting reconciliation", "count", pending)
 			}
 		}
 	}

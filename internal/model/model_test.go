@@ -3,6 +3,8 @@ package model
 import (
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestFillSessionTransitionsThroughOperationalStates(t *testing.T) {
@@ -34,5 +36,20 @@ func TestAlarmChannelSummaryPreservesRequiredFailure(t *testing.T) {
 	}, now)
 	if alarm.State != AlarmPartial {
 		t.Fatalf("state=%s", alarm.State)
+	}
+}
+
+func TestValveCommandIDForIsDeterministic(t *testing.T) {
+	sessionID := uuid.New()
+	first := ValveCommandIDFor(sessionID, ValveOpen)
+	second := ValveCommandIDFor(sessionID, ValveOpen)
+	if first != second {
+		t.Fatalf("same operation produced different ids: %s vs %s", first, second)
+	}
+	if other := ValveCommandIDFor(sessionID, ValveClose); other == first {
+		t.Fatal("open and close share a command id")
+	}
+	if other := ValveCommandIDFor(uuid.New(), ValveOpen); other == first {
+		t.Fatal("different sessions share a command id")
 	}
 }

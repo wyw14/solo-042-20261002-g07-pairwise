@@ -3,6 +3,7 @@ package fill
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -15,6 +16,12 @@ import (
 )
 
 var ErrActiveSession = errors.New("vessel already has an active fill session")
+
+// ErrCommandUnconfirmed means a valve command was dispatched but its
+// outcome is unknown (timeout or transport error). The valve may physically
+// have acted, so the circuit reservation is retained as faulted and the
+// session stays active until an operator reconciles the pending command.
+var ErrCommandUnconfirmed = errors.New("valve command outcome is unconfirmed")
 
 type Coordinator struct {
 	mu          sync.RWMutex
@@ -82,22 +89,39 @@ func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.F
 		CircuitID:         selected.ID,
 		CircuitGeneration: reservation.Generation,
 		ValveID:           selected.ValveID,
-		OpenCommandID:     uuid.New(),
-		CloseCommandID:    uuid.New(),
+		OpenCommandID:     model.ValveCommandIDFor(session.ID, model.ValveOpen),
+		CloseCommandID:    model.ValveCommandIDFor(session.ID, model.ValveClose),
+	}
+	// Track the route before dispatching so the close command stays
+	// reachable even when the open outcome is uncertain.
+	if err := c.routes.TrackOpen(route); err != nil {
+		_, _ = c.vessels.FinishFill(vesselID)
+		_ = c.circuits.Release(selected.ID, session.ID)
+		return model.FillSession{}, err
 	}
 	var openErr error
 	if c.retry != nil {
-		_, openErr = c.retry.Open(ctx, session.ID, reservation.Generation, selected.ValveID)
-		if openErr == nil {
-			openErr = c.routes.TrackOpen(route)
-		}
+		_, openErr = c.retry.Open(ctx, route.OpenCommandID, session.ID, reservation.Generation, selected.ValveID)
 	} else {
 		openErr = c.routes.Open(ctx, route)
 	}
 	if openErr != nil {
-		_, _ = c.vessels.FinishFill(vesselID)
-		_ = c.circuits.Release(selected.ID, session.ID)
-		return model.FillSession{}, openErr
+		if errors.Is(openErr, valve.ErrCommandRejected) {
+			// The valve definitively refused to open: nothing was actuated,
+			// so the reservation can be rolled back safely.
+			c.routes.Untrack(session.ID)
+			_, _ = c.vessels.FinishFill(vesselID)
+			_ = c.circuits.Release(selected.ID, session.ID)
+			return model.FillSession{}, openErr
+		}
+		// Timeout or transport error: the open outcome is UNKNOWN and the
+		// valve may physically be open. Do not assume failure — keep the
+		// circuit reserved (faulted) and the session active until the
+		// pending command is reconciled.
+		_ = c.circuits.RetainFault(selected.ID, session.ID)
+		c.sessions[session.ID] = session
+		c.active[vesselID] = session.ID
+		return session, fmt.Errorf("%w: %w", ErrCommandUnconfirmed, openErr)
 	}
 	session, err = session.Transition(model.FillFilling, c.now())
 	if err != nil {

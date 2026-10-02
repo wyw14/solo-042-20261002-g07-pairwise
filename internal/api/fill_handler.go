@@ -32,7 +32,7 @@ func (s *Server) startFill(writer http.ResponseWriter, request *http.Request) {
 	session, err := s.deps.Fills.StartManual(request.Context(), input.VesselID, input.Liters)
 	if err != nil {
 		status := http.StatusConflict
-		if !errors.Is(err, fill.ErrActiveSession) && !errors.Is(err, circuit.ErrCircuitBusy) {
+		if !errors.Is(err, fill.ErrActiveSession) && !errors.Is(err, circuit.ErrCircuitBusy) && !errors.Is(err, fill.ErrCommandUnconfirmed) {
 			status = http.StatusBadRequest
 		}
 		writeError(writer, status, err.Error())

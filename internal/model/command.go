@@ -14,6 +14,18 @@ const (
 	ValveClose ValveAction = "close"
 )
 
+// valveCommandNamespace scopes deterministic valve command IDs to this
+// deployment domain. It must never change once commands have been issued.
+var valveCommandNamespace = uuid.MustParse("c07e1f5a-8b3d-4e2a-9f16-5d7a3b9c1e04")
+
+// ValveCommandIDFor derives the stable command ID for one logical valve
+// operation. The same (session, action) pair always yields the same ID, so
+// retries and post-restart recovery reuse the original identity instead of
+// minting a fresh one that could actuate the valve twice.
+func ValveCommandIDFor(sessionID uuid.UUID, action ValveAction) uuid.UUID {
+	return uuid.NewSHA1(valveCommandNamespace, []byte(sessionID.String()+":"+string(action)))
+}
+
 type ValveCommand struct {
 	ID                uuid.UUID   `json:"id"`
 	FillSessionID     uuid.UUID   `json:"fill_session_id"`
