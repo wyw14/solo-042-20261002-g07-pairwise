@@ -91,6 +91,22 @@ func (m *Manager) RetainFault(circuitID string, sessionID uuid.UUID) error {
 	return nil
 }
 
+// ReleaseConfirmed 在关阀命令已被设备确认执行后释放预留，
+// 即使预留此前因结果未知被标记为故障。调用方必须持有“阀门已确认关闭”这一前提。
+func (m *Manager) ReleaseConfirmed(circuitID string, sessionID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.reservations[circuitID]
+	if !ok {
+		return nil
+	}
+	if current.SessionID != sessionID {
+		return ErrReservationMismatch
+	}
+	delete(m.reservations, circuitID)
+	return nil
+}
+
 func (m *Manager) Recover(circuitID string, sessionID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -107,4 +123,27 @@ func (m *Manager) Get(circuitID string) (Reservation, bool) {
 	defer m.mu.Unlock()
 	reservation, ok := m.reservations[circuitID]
 	return reservation, ok
+}
+
+// RestoreReservation 在进程重启重放后重建回路预留。
+// 同一回路已被占用且归属不同会话时返回错误，避免恢复出互相矛盾的预留。
+func (m *Manager) RestoreReservation(reservation Reservation) error {
+	if reservation.CircuitID == "" || reservation.SessionID == uuid.Nil || reservation.Generation == 0 {
+		return errors.New("invalid circuit reservation")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.reservations[reservation.CircuitID]; ok {
+		if existing.SessionID != reservation.SessionID {
+			return ErrCircuitBusy
+		}
+		if existing.Generation > reservation.Generation {
+			return errors.New("restored reservation generation moved backward")
+		}
+	}
+	if generation := m.generations[reservation.CircuitID]; reservation.Generation > generation {
+		m.generations[reservation.CircuitID] = reservation.Generation
+	}
+	m.reservations[reservation.CircuitID] = reservation
+	return nil
 }

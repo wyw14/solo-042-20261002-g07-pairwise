@@ -59,20 +59,32 @@ func (s *CompletionService) Complete(ctx context.Context, sessionID uuid.UUID) (
 	if err != nil {
 		return model.FillSession{}, err
 	}
-	completed, err := verified.Transition(model.FillCompleted, s.now())
+
+	route, ok, err := s.coordinator.routes.Get(session.ID)
 	if err != nil {
 		return model.FillSession{}, err
 	}
-	if err := s.coordinator.routes.Close(ctx, session.ID); err != nil {
+	if !ok {
+		return model.FillSession{}, errors.New("route is not open")
+	}
+	if err := s.coordinator.recordCloseIntentLocked(verified, model.FillCompleted, "", route.CloseCommandID); err != nil {
+		return model.FillSession{}, err
+	}
+
+	closeState, err := s.coordinator.routes.Close(ctx, session.ID)
+	if err != nil {
+		return model.FillSession{}, err
+	}
+	switch {
+	case closeState.KnownExecuted():
+		return s.coordinator.closeOut(verified, model.FillCompleted, "")
+	default:
+		// 关阀未确认执行（结果未知，或设备明确未执行——阀门可能仍开着）：
+		// 一律保留故障预留与容器 filling，会话保持 active，等待同 ID 补发回执，
+		// 补发耗尽后由外发箱转 awaiting 人工对账；绝不能把仍可能通液的回路释放。
 		_ = s.coordinator.circuits.RetainFault(session.CircuitID, session.ID)
-		return model.FillSession{}, err
+		held := verified
+		s.coordinator.sessions[session.ID] = held
+		return held, ErrCommandUnconfirmed
 	}
-	if err := s.coordinator.circuits.Release(session.CircuitID, session.ID); err != nil {
-		return model.FillSession{}, err
-	}
-	if _, err := s.coordinator.vessels.FinishFill(session.VesselID); err != nil {
-		return model.FillSession{}, err
-	}
-	s.coordinator.finishState(completed)
-	return completed, nil
 }

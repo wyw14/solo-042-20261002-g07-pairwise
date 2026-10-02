@@ -29,7 +29,7 @@ func (s *Server) startFill(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusBadRequest, err.Error())
 		return
 	}
-	session, err := s.deps.Fills.StartManual(request.Context(), input.VesselID, input.Liters)
+	outcome, err := s.deps.Fills.StartManual(request.Context(), input.VesselID, input.Liters)
 	if err != nil {
 		status := http.StatusConflict
 		if !errors.Is(err, fill.ErrActiveSession) && !errors.Is(err, circuit.ErrCircuitBusy) {
@@ -38,7 +38,12 @@ func (s *Server) startFill(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, status, err.Error())
 		return
 	}
-	writeJSON(writer, http.StatusCreated, session)
+	// 开阀命令已持久化但结果未知：不宣告成功也不宣告失败，返回 202 待确认。
+	if outcome.Awaiting {
+		writeJSON(writer, http.StatusAccepted, outcome)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, outcome)
 }
 
 func (s *Server) beginSoak(writer http.ResponseWriter, request *http.Request) {
@@ -63,6 +68,15 @@ func (s *Server) completeFill(writer http.ResponseWriter, request *http.Request)
 	}
 	session, err := s.deps.Fills.Complete(request.Context(), id)
 	if err != nil {
+		// 关阀结果未知：回路已保留为故障，返回 202 并附上挂起会话，引导人工对账。
+		if errors.Is(err, fill.ErrCommandUnconfirmed) {
+			writeJSON(writer, http.StatusAccepted, map[string]any{
+				"session":  session,
+				"awaiting": true,
+				"message":  err.Error(),
+			})
+			return
+		}
 		writeError(writer, http.StatusConflict, err.Error())
 		return
 	}
@@ -82,6 +96,14 @@ func (s *Server) abortFill(writer http.ResponseWriter, request *http.Request) {
 	}
 	session, err := s.deps.Fills.Abort(request.Context(), id, input.Reason)
 	if err != nil {
+		if errors.Is(err, fill.ErrCommandUnconfirmed) {
+			writeJSON(writer, http.StatusAccepted, map[string]any{
+				"session":  session,
+				"awaiting": true,
+				"message":  err.Error(),
+			})
+			return
+		}
 		writeError(writer, http.StatusConflict, err.Error())
 		return
 	}

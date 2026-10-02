@@ -29,6 +29,7 @@ type runtime struct {
 	retryQueue   *notify.RetryQueue
 	dispatcher   *notify.Dispatcher
 	alarmService *alarm.Service
+	fills        *fill.Service
 }
 
 func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
@@ -147,17 +148,24 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	commandService := valve.NewCommandService(valveController, now)
-	routeService := valve.NewRouteService(commandService)
-	fillCoordinator := fill.NewCoordinator(circuitManager, circuitRegistry, routeService, vesselState, now)
-	retryService, err := fill.NewRetryService(commandService, fill.RetryPolicy{Attempts: 3, Delay: 100 * time.Millisecond})
+	// 持久命令外发箱：开关阀请求、尝试、回执全部落盘，跨重启可恢复。
+	valveOutbox, err := valve.NewOutbox(store, valveController, now)
 	if err != nil {
 		return nil, err
 	}
-	fillCoordinator.SetRetryService(retryService)
+	routeService, err := valve.NewRouteService(valveOutbox, store, now)
+	if err != nil {
+		return nil, err
+	}
+	fillCoordinator := fill.NewCoordinator(circuitManager, circuitRegistry, routeService, vesselState, store, now)
 	completion := fill.NewCompletionService(fillCoordinator, pressureMonitor, store, now)
 	aborts := fill.NewAbortService(fillCoordinator, now)
-	fillService, err := fill.NewService(fillCoordinator, completion, aborts, 2.1)
+	reconcile := fill.NewReconcileService(fillCoordinator, routeService, valveOutbox, store, now)
+	// 重放崩溃时仍开通的阀门通路：恢复回路预留与容器 filling，会话停留 awaiting_valve。
+	if err := reconcile.Restore(); err != nil {
+		return nil, err
+	}
+	fillService, err := fill.NewService(fillCoordinator, completion, aborts, reconcile, 2.1)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +221,7 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	return &runtime{server: server, retryQueue: retryQueue, dispatcher: dispatcher, alarmService: alarmService}, nil
+	return &runtime{server: server, retryQueue: retryQueue, dispatcher: dispatcher, alarmService: alarmService, fills: fillService}, nil
 }
 
 func (r *runtime) run(ctx context.Context) error {
@@ -221,8 +229,16 @@ func (r *runtime) run(ctx context.Context) error {
 	go func() {
 		serveErrors <- r.server.ListenAndServe()
 	}()
+	// 启动后用原命令 ID 补发崩溃/超时前未决的开关阀命令，并收敛会话状态。
+	recoverCtx, cancelRecover := context.WithTimeout(ctx, 15*time.Second)
+	if err := r.fills.Recover(recoverCtx); err != nil {
+		slog.Error("valve command recovery failed", "error", err)
+	}
+	cancelRecover()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	recoverTicker := time.NewTicker(10 * time.Second)
+	defer recoverTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -238,6 +254,14 @@ func (r *runtime) run(ctx context.Context) error {
 			_ = r.retryQueue.RunDue(ctx, r.dispatcher)
 			if pending := len(r.retryQueue.Pending()); pending > 0 {
 				slog.Warn("alarm notifications awaiting retry", "count", pending)
+			}
+		case <-recoverTicker.C:
+			// 同 ID 补发未决命令；待人工确认的命令不会自动重发。
+			if err := r.fills.Recover(ctx); err != nil {
+				slog.Error("valve command recovery tick failed", "error", err)
+			}
+			if pending := r.fills.PendingCommands(); len(pending) > 0 {
+				slog.Warn("valve commands awaiting confirmation", "count", len(pending))
 			}
 		}
 	}

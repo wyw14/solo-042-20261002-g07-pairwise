@@ -23,21 +23,30 @@ type ValveCommand struct {
 	IssuedAt          time.Time   `json:"issued_at"`
 }
 
+// ValidateIdentity 校验命令身份字段，不依赖构造时间。
+func (c ValveCommand) ValidateIdentity() error {
+	if c.ID == uuid.Nil || c.FillSessionID == uuid.Nil || c.CircuitGeneration == 0 || c.ValveID == "" {
+		return errors.New("invalid valve command identity")
+	}
+	if c.Action != ValveOpen && c.Action != ValveClose {
+		return errors.New("invalid valve action")
+	}
+	return nil
+}
+
 func NewValveCommand(id, sessionID uuid.UUID, generation uint64, valveID string, action ValveAction, now time.Time) (ValveCommand, error) {
-	if id == uuid.Nil || sessionID == uuid.Nil || generation == 0 || valveID == "" {
-		return ValveCommand{}, errors.New("invalid valve command identity")
-	}
-	if action != ValveOpen && action != ValveClose {
-		return ValveCommand{}, errors.New("invalid valve action")
-	}
-	return ValveCommand{
+	command := ValveCommand{
 		ID:                id,
 		FillSessionID:     sessionID,
 		CircuitGeneration: generation,
 		ValveID:           valveID,
 		Action:            action,
 		IssuedAt:          now.UTC(),
-	}, nil
+	}
+	if err := command.ValidateIdentity(); err != nil {
+		return ValveCommand{}, err
+	}
+	return command, nil
 }
 
 type ValveReceipt struct {
